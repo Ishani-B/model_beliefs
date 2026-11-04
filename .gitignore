@@ -1,0 +1,10 @@
+# large run outputs (answers + activations) live outside git
+data/*
+!data/.gitkeep
+*.pt
+*.safetensors
+*.npy
+
+__pycache__/
+*.egg-info/
+.venv/
