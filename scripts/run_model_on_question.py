@@ -2,7 +2,7 @@
 
 Saves, per run directory:
   meta.json                 run settings, model info, position definitions
-  responses.jsonl           one row per (case, question, sample)
+  responses.jsonl           one row per (case, question, option order, sample)
   activations/<case>.npz    residual-stream activations for that case's rows, keys:
                               context_end  last token of the case context
                               prompt_end   last token of the prompt (start of the reply)
@@ -57,12 +57,18 @@ def parse_args():
     p.add_argument("--pure-sampling", action="store_true",
                    help="paper setting: no top-p/top-k truncation. Default keeps the model's own "
                         "recommended top-p/top-k (small models produce gibberish without it)")
-    p.add_argument("--max-new-tokens", type=int, default=512)
+    p.add_argument("--max-new-tokens", type=int, default=1024)
     p.add_argument("--no-reasoning", action="store_true", help="ask for the answer only, no reasoning")
     p.add_argument("--no-activations", action="store_true")
-    p.add_argument("--flip-options", action="store_true",
-                   help="show every multiple-choice question with its options in reverse order (controls for "
-                        "letter bias). Saved answers are mapped back to the original order")
+    p.add_argument("--orders", default="both", choices=["both", "normal", "flip"],
+                   help="option order for multiple-choice questions. both (default) asks every question in the "
+                        "original and the reversed order, to control for letter bias. Answers are always saved "
+                        "in the original order")
+    p.add_argument("--flip-options", action="store_true", help="same as --orders flip")
+    p.add_argument("--batch-size", type=int, default=64,
+                   help="prompts generated together; whole cases are grouped up to this size")
+    p.add_argument("--act-batch-size", type=int, default=8,
+                   help="prompts per forward pass when reading activations (lower if out of memory)")
     p.add_argument("--tag", default="", help="extra label for the run directory")
     p.add_argument("--out", default="data")
     p.add_argument("--device", default="auto", help="auto | mps | cuda | cpu")
@@ -154,66 +160,121 @@ def option_token_ids(tok, n: int) -> list[list[int]]:
     return ids
 
 
-@torch.no_grad()
-def run_one(tok, model, device, system, user, context, q, args, want_acts):
-    text = chat_text(tok, system, user)
-    enc = tok(text, return_tensors="pt", return_offsets_mapping=True, add_special_tokens=False)
-    offsets = enc.pop("offset_mapping")[0].tolist()
-    input_ids = enc["input_ids"].to(device)
-    n_prompt = input_ids.shape[1]
-
-    ctx_start = text.rfind(context)
-    ctx_tok = token_index_ending_at(offsets, ctx_start + len(context)) if ctx_start >= 0 else n_prompt - 1
-
-    sampling = {"do_sample": args.temperature > 0}
+def sampling_kwargs(args) -> dict:
+    kw = {"do_sample": args.temperature > 0}
     if args.temperature > 0:
-        sampling["temperature"] = args.temperature
+        kw["temperature"] = args.temperature
         if args.pure_sampling:
-            sampling.update(top_p=1.0, top_k=0)
-    gen = model.generate(
-        input_ids, attention_mask=torch.ones_like(input_ids), **sampling,
-        max_new_tokens=args.max_new_tokens, pad_token_id=tok.eos_token_id)
-    reply = tok.decode(gen[0, n_prompt:], skip_special_tokens=True)
-    answer, ans_start = parse_answer(q.kind, reply, len(q.options))
+            kw.update(top_p=1.0, top_k=0)
+    return kw
 
-    # Teacher-force the answer marker after the model's own reasoning, then read the
-    # next-token distribution (option probabilities) and activations at that point.
-    reasoning = reply[:ans_start] if ans_start is not None else reply.rstrip() + "\n"
-    marker = '{"probability":' if q.kind == "probability" else "Choice:"
-    forced = tok(text + reasoning + marker, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
-    out = model(forced, output_hidden_states=want_acts)
 
-    option_probs = None
-    if q.kind != "probability":
-        logp = torch.log_softmax(out.logits[0, -1].float(), -1)
-        per_opt = torch.stack([torch.logsumexp(logp[ids], 0) for ids in option_token_ids(tok, len(q.options))])
-        option_probs = torch.softmax(per_opt, 0).tolist()
+def map_back(res: dict, q) -> dict:
+    """For a flipped question, convert answer/choice/action/option_probs back to the original option order."""
+    n = len(q.options)
+    res["choice_shown"] = res["choice"]
+    if res["answer"] is not None:
+        res["answer"] = n - 1 - res["answer"]
+        res["choice"] = LETTERS[res["answer"]]
+        res["action"] = int(res["answer"] == 0) if q.kind == "binary" else None
+    if res["option_probs"]:
+        res["option_probs"] = res["option_probs"][::-1]
+    return res
 
-    acts = None
-    if want_acts:
-        hs = torch.stack(out.hidden_states, 0)[:, 0]  # [layers+1, T, d]
-        acts = {
-            "context_end": hs[:, ctx_tok],
-            "prompt_end": hs[:, n_prompt - 1],
-            "answer": hs[:, -1],
-        }
-        acts = {k: v.float().cpu().numpy().astype(np.float16) for k, v in acts.items()}
 
-    return {
-        "reply": reply,
-        "answer": answer,  # probability: float. choices: option index (0 = A)
-        "choice": None if (answer is None or q.kind == "probability") else LETTERS[answer],
-        "action": None if (answer is None or q.kind != "binary") else int(answer == 0),  # 1 = act as if y=1
-        "parsed": answer is not None,
-        "option_probs": option_probs,
-        "n_prompt_tokens": n_prompt,
-        "n_reply_tokens": int(gen.shape[1] - n_prompt),
-        "context_end_token": ctx_tok,
-    }, acts
+@torch.no_grad()
+def run_batch(tok, model, device, jobs, args, want_acts):
+    """Run a list of jobs (each: dict with text, context, q_shown) in one generate call.
+
+    Returns a list of (result dict, activations dict or None), in job order.
+    """
+    texts = [j["text"] for j in jobs]
+    prompt_ids, ctx_tok = [], []
+    for j in jobs:
+        enc = tok(j["text"], return_offsets_mapping=True, add_special_tokens=False)
+        prompt_ids.append(enc["input_ids"])
+        cs = j["text"].rfind(j["context"])
+        ctx_tok.append(token_index_ending_at(enc["offset_mapping"], cs + len(j["context"]))
+                       if cs >= 0 else len(enc["input_ids"]) - 1)
+
+    batch = tok(texts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
+    gen = model.generate(**batch, **sampling_kwargs(args), max_new_tokens=args.max_new_tokens,
+                         pad_token_id=tok.pad_token_id)
+    new = gen[:, batch["input_ids"].shape[1]:]
+    replies = tok.batch_decode(new, skip_special_tokens=True)
+    n_new = [int((row != tok.pad_token_id).sum()) for row in new]
+
+    # Teacher-force the answer marker after each reply's reasoning; read option probabilities
+    # and activations there. Done in smaller sub-batches (full hidden states are large).
+    parsed, forced_texts = [], []
+    for j, reply in zip(jobs, replies):
+        q = j["q_shown"]
+        ans, start = parse_answer(q.kind, reply, len(q.options))
+        parsed.append(ans)
+        reasoning = reply[:start] if start is not None else reply.rstrip() + "\n"
+        marker = '{"probability":' if q.kind == "probability" else "Choice:"
+        forced_texts.append(j["text"] + reasoning + marker)
+
+    out = [None] * len(jobs)
+    bs = args.act_batch_size
+    for s in range(0, len(jobs), bs):
+        idx = list(range(s, min(s + bs, len(jobs))))
+        fb = tok([forced_texts[i] for i in idx], return_tensors="pt", padding=True,
+                 add_special_tokens=False).to(device)
+        # left padding: give real tokens positions 0..n-1 so activations don't depend on batch padding
+        pos_ids = (fb["attention_mask"].cumsum(-1) - 1).clamp(min=0)
+        res = model(**fb, position_ids=pos_ids, output_hidden_states=want_acts, logits_to_keep=1)
+        T = fb["input_ids"].shape[1]
+        lens = fb["attention_mask"].sum(1).tolist()
+        logp_all = torch.log_softmax(res.logits[:, -1].float(), -1)
+        hs = torch.stack(res.hidden_states, 0) if want_acts else None  # [L+1, B, T, d]
+        for b, i in enumerate(idx):
+            q = jobs[i]["q_shown"]
+            option_probs = None
+            if q.kind != "probability":
+                per = torch.stack([torch.logsumexp(logp_all[b, ids], 0)
+                                   for ids in option_token_ids(tok, len(q.options))])
+                option_probs = torch.softmax(per, 0).tolist()
+            acts = None
+            if want_acts:
+                pad = T - lens[b]
+                pos = {"context_end": pad + ctx_tok[i], "prompt_end": pad + len(prompt_ids[i]) - 1, "answer": T - 1}
+                acts = {k: hs[:, b, p].float().cpu().numpy().astype(np.float16) for k, p in pos.items()}
+            ans = parsed[i]
+            out[i] = ({
+                "reply": replies[i],
+                "answer": ans,  # probability: float. choices: option index (0 = A)
+                "choice": None if (ans is None or q.kind == "probability") else LETTERS[ans],
+                "action": None if (ans is None or q.kind != "binary") else int(ans == 0),  # 1 = act as if y=1
+                "parsed": ans is not None,
+                "option_probs": option_probs,
+                "n_prompt_tokens": len(prompt_ids[i]),
+                "n_reply_tokens": n_new[i],
+                "context_end_token": ctx_tok[i],
+            }, acts)
+        del res, hs
+    return out
+
+
+def make_jobs(scenario, questions, case, system, tok, args):
+    orders = {"normal": [False], "flip": [True], "both": [False, True]}[args.orders]
+    jobs = []
+    for flip in orders:
+        for q in questions:
+            f = flip and q.kind != "probability"
+            qs = dataclasses.replace(q, options=q.options[::-1]) if f else q
+            user, context = build_prompt(scenario, qs, case, reasoning=not args.no_reasoning)
+            for s in range(args.samples):
+                jobs.append({"case": case, "q": q, "q_shown": qs, "flipped": f,
+                             "order": "flip" if flip else "normal", "sample": s, "prompt": user,
+                             "context": context, "text": chat_text(tok, system, user)})
+    return jobs
 
 
 def main():
     args = parse_args()
+    if args.flip_options:
+        args.orders = "flip"
     torch.manual_seed(args.seed)
     scenario = load_scenario(args.scenario)
     questions = build_questions(scenario)
@@ -228,7 +289,7 @@ def main():
     model_slug = args.model.split("/")[-1] + (f"+{args.adapter.split('/')[-1]}" if args.adapter else "")
     run_name = "__".join(x for x in [scenario["domain"], model_slug, args.tag,
                                      "noreason" if args.no_reasoning else "",
-                                     "flip" if args.flip_options else ""] if x)
+                                     "" if args.orders == "both" else args.orders] if x)
     out_dir = Path(args.out) / run_name
     (out_dir / "activations").mkdir(parents=True, exist_ok=True)
     resp_path = out_dir / "responses.jsonl"
@@ -241,12 +302,15 @@ def main():
 
     print(f"loading {args.model} on {device} ({dtype})")
     tok, model = load_model(args, device, dtype)
+    tok.padding_side = "left"
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
     cfg = model.config
     meta = {
         "scenario": args.scenario, "domain": scenario["domain"], "event": scenario.get("event"),
         "model": args.model, "adapter": args.adapter, "system": system,
         "reasoning": not args.no_reasoning, "samples": args.samples, "temperature": args.temperature,
-        "pure_sampling": args.pure_sampling, "flip_options": args.flip_options,
+        "pure_sampling": args.pure_sampling, "orders": args.orders,
         "generation_config": {k: getattr(model.generation_config, k, None) for k in ("top_p", "top_k", "temperature")},
         "max_new_tokens": args.max_new_tokens, "seed": args.seed, "device": device, "dtype": str(dtype),
         "n_layers": getattr(cfg, "num_hidden_layers", None), "d_model": getattr(cfg, "hidden_size", None),
@@ -260,45 +324,45 @@ def main():
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
-    t0 = time.time()
-    for ci, case in enumerate(cases):
-        if case["id"] in done:
-            continue
-        rows, acts = [], {k: [] for k in POSITIONS}
-        for q in questions:
-            flip = args.flip_options and q.kind != "probability"
-            qs = dataclasses.replace(q, options=q.options[::-1]) if flip else q
-            user, context = build_prompt(scenario, qs, case, reasoning=not args.no_reasoning)
-            for s in range(args.samples):
-                res, a = run_one(tok, model, device, system, user, context, qs, args, not args.no_activations)
-                res["flipped"] = flip
-                if flip:  # map back so answer/choice/action/option_probs use the original option order
-                    n = len(q.options)
-                    res["choice_shown"] = res["choice"]
-                    if res["answer"] is not None:
-                        res["answer"] = n - 1 - res["answer"]
-                        res["choice"] = LETTERS[res["answer"]]
-                        res["action"] = int(res["answer"] == 0) if q.kind == "binary" else None
-                    if res["option_probs"]:
-                        res["option_probs"] = res["option_probs"][::-1]
+    todo = [c for c in cases if c["id"] not in done]
+    t0, n_done = time.time(), len(cases) - len(todo)
+    per_case = len(make_jobs(scenario, questions, cases[0], system, tok, args))
+    cases_per_batch = max(1, args.batch_size // per_case)
+    for b in range(0, len(todo), cases_per_batch):
+        chunk = todo[b:b + cases_per_batch]
+        jobs = [j for c in chunk for j in make_jobs(scenario, questions, c, system, tok, args)]
+        results = run_batch(tok, model, device, jobs, args, not args.no_activations)
+        for case in chunk:
+            rows, acts = [], {k: [] for k in POSITIONS}
+            for j, (res, a) in zip(jobs, results):
+                if j["case"] is not case:
+                    continue
+                q = j["q"]
+                res["flipped"] = j["flipped"]
+                if j["flipped"]:
+                    res = map_back(res, q)
                 rows.append({
                     "case_id": case["id"], "label": case.get("label"), "question_id": q.id,
                     "kind": q.kind, "framing": q.framing, "ratio": q.ratio,
-                    "implied_threshold": q.implied_threshold, "sample": s, "prompt": user, **res,
+                    "implied_threshold": q.implied_threshold, "order": j["order"], "sample": j["sample"],
+                    "prompt": j["prompt"], **res,
                 })
                 if a is not None:
                     for k in POSITIONS:
                         acts[k].append(a[k])
-        if not args.no_activations:
-            np.savez_compressed(out_dir / "activations" / f"{case['id']}.npz",
-                                **{k: np.stack(v) for k, v in acts.items()})
-        with resp_path.open("a") as f:
-            for r in rows:
-                f.write(json.dumps(r) + "\n")
+            if not args.no_activations:
+                np.savez_compressed(out_dir / "activations" / f"{case['id']}.npz",
+                                    **{k: np.stack(v) for k, v in acts.items()})
+            with resp_path.open("a") as f:
+                for r in rows:
+                    f.write(json.dumps(r) + "\n")
+            n_done += 1
+            n_ok = sum(r["parsed"] for r in rows)
+            print(f"[{n_done}/{len(cases)}] {case['id']}: {n_ok}/{len(rows)} parsed  ({time.time() - t0:.0f}s)")
         if device == "mps":
             torch.mps.empty_cache()
-        n_ok = sum(r["parsed"] for r in rows)
-        print(f"[{ci + 1}/{len(cases)}] {case['id']}: {n_ok}/{len(rows)} parsed  ({time.time() - t0:.0f}s)")
+        elif device == "cuda":
+            torch.cuda.empty_cache()
 
     print(f"done -> {out_dir}")
 
