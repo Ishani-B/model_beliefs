@@ -281,7 +281,7 @@ def analyse(run_dirs, out_dir, args):
         for j, q in enumerate(obs.binary):
             a, b = float(model.alpha[j]), float(model.b_beta()[j])
             thresholds[q] = {"framing": obs.qspec[q]["framing"], "nominal": obs.qspec[q]["implied_threshold"],
-                             "fitted": 1 / (1 + math.exp(a / b)), "alpha": a, "beta": b}
+                             "fitted": float(torch.sigmoid(torch.tensor(-a / b, dtype=torch.float64))), "alpha": a, "beta": b}
 
     out_dir.mkdir(parents=True, exist_ok=True)
     sp = np.array(["train"] * n, dtype=object); sp[val] = "val"; sp[test] = "test"
