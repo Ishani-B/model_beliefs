@@ -21,6 +21,7 @@ datasets/                          one scenario JSON per domain (format: dataset
   insecure_code.json               our own case (draft): does this code have a vulnerability
 scripts/run_model_on_question.py   runs a model on the 16 questions, saves answers + activations
 scripts/extract_model_belief.py    fits the paper's latent belief model, writes belief readouts
+scripts/slim_activations.py        keeps every 4th layer of saved activations, for copying off a GPU box
 scripts/control_model_organism.py  (todo) checks readouts against model organisms with known beliefs
 data/                              run outputs (git-ignored, large)
 results/                           write-ups of runs
@@ -70,6 +71,8 @@ Useful flags: `--n-cases N` (quick test), `--no-reasoning` (answer only, much fa
 - `activations/<case>.npz`: float16 arrays `[rows, layers+1, d_model]` at `context_end` (end of the
   case details), `prompt_end` (end of the prompt) and `answer` (just before the answer, after the
   model's reasoning). Row k matches the k-th row for that case in `responses.jsonl`.
+- `activations_slim/<case>.npz` (from `slim_activations.py`): the same, but only layers
+  0, 4, ..., 28 (listed under `layers`). About a third of the size.
 - `beliefs.csv` / `fit.json` (from `extract_model_belief.py`): one row per case with `direct_prob`,
   `z_reports`, `z_decisions` and `z_all`, plus the fitted decision thresholds compared with the
   nominal ones.
