@@ -8,8 +8,8 @@ Three readouts of what a small model believes about a yes/no unknown `y`:
 1. **Ask it**: its stated probability, Likert answer and probability bin.
 2. **Infer it from its decisions**: the latent belief `z` of Smolin & Wilder (2026), *Beliefs and
    Behavior in Language Models*, [arXiv:2609.07943](https://arxiv.org/abs/2609.07943).
-3. **Read it from inside the model**: a linear probe on the residual stream trained to match `z`.
-   (Not built yet.)
+3. **Read it from inside the model**: a linear probe on the residual stream
+   (`scripts/train_probe.py`, `scripts/probe_cv.py`).
 
 ## Layout
 
@@ -24,7 +24,7 @@ scripts/extract_model_belief.py    fits the paper's latent belief model, writes 
 scripts/slim_activations.py        keeps every 4th layer of saved activations, for copying off a GPU box
 scripts/control_model_organism.py  (todo) checks readouts against model organisms with known beliefs
 data/                              run outputs (git-ignored, large)
-results/                           write-ups of runs
+results/                           write-ups of runs (start with results/blog_post.md)
 ```
 
 ## Setup
