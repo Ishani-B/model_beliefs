@@ -24,7 +24,7 @@ scripts/extract_model_belief.py    fits the paper's latent belief model, writes 
 scripts/slim_activations.py        keeps every 4th layer of saved activations, for copying off a GPU box
 scripts/control_model_organism.py  (todo) checks readouts against model organisms with known beliefs
 data/                              run outputs (git-ignored, large)
-results/                           write-ups of runs (start with results/blog_post.md)
+results/                           write-ups of runs (start with results/ishani_reflections.md)
 ```
 
 ## Setup
