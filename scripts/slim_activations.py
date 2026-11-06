@@ -7,6 +7,7 @@ file under "layers".
     python scripts/slim_activations.py data/insecure_code_em__Qwen2.5-1.5B-Instruct
 """
 import argparse
+import time
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("runs", nargs="+", type=Path)
     ap.add_argument("--every", type=int, default=4, help="keep every k-th layer (plus the last)")
+    ap.add_argument("--skip-recent", action="store_true",
+                    help="skip files changed in the last 2 minutes (for use while a run is still going)")
     args = ap.parse_args()
 
     for run in args.runs:
@@ -25,7 +28,7 @@ def main():
         done, keep = 0, []
         for f in files:
             out = dst / f.name
-            if out.exists():
+            if out.exists() or (args.skip_recent and time.time() - f.stat().st_mtime < 120):  # may still be writing
                 continue
             z = np.load(f)
             n_layers = z[z.files[0]].shape[1]
